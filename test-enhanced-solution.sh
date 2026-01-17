@@ -7,7 +7,7 @@ set -e
 
 # Configuration
 STACK_NAME="ec2-devopscaptain-test"
-NOTIFICATION_EMAIL="ashishhcl86@gmail.com"  # Updated with real email
+NOTIFICATION_EMAIL=""  # Updated with real email
 AWS_REGION="us-east-1"
 
 echo "🚀 Testing Enhanced Blog-Complete EC2 Compliance Solution"
