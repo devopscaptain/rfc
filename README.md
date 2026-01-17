@@ -81,7 +81,7 @@ The script will:
 ```bash
 # Deploy CloudFormation template
 aws cloudformation deploy \
-    --template-file enhanced-blog-complete.yaml \
+    --template-file cloudfromation.yaml \
     --stack-name ec2-tag-compliance \
     --parameter-overrides NotificationEmail=your-email@company.com \
     --capabilities CAPABILITY_IAM \
