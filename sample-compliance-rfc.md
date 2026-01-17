@@ -1,78 +1,69 @@
-# AWS EC2 Compliance RFC - Name-Based Environment Detection
+# AWS EC2 Enhanced Compliance RFC - Fixed Format
 
 ## Overview
-This RFC defines compliance requirements for EC2 instances based on intelligent name-based environment detection only.
+This RFC defines comprehensive compliance requirements for EC2 instances with proper tag format.
 
 ## Environment-Specific Requirements
 
 ### Development Environment
 **Detection Criteria:**
 - Instance names containing: dev, development, sandbox
-- Instance ID containing: dev (if no Name tag)
 
 **Required Tags:**
-- Environment: development
-- Owner: ashish
-- Project: development-project
-- CostCenter: dev-ops
-- Purpose: poc
-- Country: india
+Environment = development
+Owner = dev-team@company.com
+Project = development-project
+CostCenter = DEV-2024
+Purpose = development-testing
+Country = usa
 
 **Monitoring Requirements:**
 - CPUUtilization alarm (threshold: 90%)
-- Evaluation period: 10 minutes (cost optimization)
+- Evaluation period: 10 minutes
 
 ### Production Environment
 **Detection Criteria:**
 - Instance names containing: prod, production, live
-- Instance ID containing: prod (if no Name tag)
 
 **Required Tags:**
-- Environment: production
-- Owner: ashish
-- Application: production-app
-- CostCenter: prod-ops
-- BusinessUnit: engineering
-- Purpose: poc
-- Country: india
+Environment = production
+Owner = platform-team@company.com
+Application = production-app
+CostCenter = PROD-2024
+BusinessUnit = engineering
+Purpose = production-workload
+Country = usa
 
 **Monitoring Requirements:**
 - CPUUtilization alarm (threshold: 80%)
-- StatusCheckFailed alarm
-- NetworkIn alarm (threshold: 1GB)
-- Evaluation period: 5 minutes (high availability)
+- Evaluation period: 5 minutes
 
 ### Testing Environment
 **Detection Criteria:**
 - Instance names containing: test, staging, qa
-- Instance ID containing: test (if no Name tag)
 
 **Required Tags:**
-- Environment: testing
-- Owner: ashish
-- TestSuite: automated-tests
-- CostCenter: qa-ops
-- Purpose: poc
-- Country: india
+Environment = testing
+Owner = qa-team@company.com
+TestSuite = automated-tests
+CostCenter = QA-2024
+Purpose = quality-assurance
+Country = usa
 
 **Monitoring Requirements:**
 - CPUUtilization alarm (threshold: 85%)
-- StatusCheckFailed alarm
 - Evaluation period: 5 minutes
 
-## Default Behavior
-- If no environment indicators found in name or instance ID: **defaults to development**
-- Instance type is NOT considered for environment detection
-- Only name-based intelligent detection is used
+## Enhanced Features
+- 5-stage notification system
+- Two-pass AI analysis (structure + values)
+- Graceful fallback if Bedrock unavailable
+- Enhanced retry policies (2 attempts, 1-hour max age)
+- Comprehensive error handling
 
 ## Compliance Actions
-1. **Name-Only Detection**: AI analyzes instance name and ID only
-2. **Smart Tagging**: Environment-specific tags applied automatically
-3. **Monitoring Setup**: Appropriate alarms created based on environment
-4. **Notification**: Detailed email with emojis sent for all actions
-5. **Verification**: Post-remediation compliance check
-
-## Cost Optimization
-- Development: Minimal monitoring to reduce costs
-- Production: Full monitoring for reliability
-- Testing: Balanced approach for quality assurance
+1. **Stage 1**: Launch detection notification
+2. **Stage 2**: RFC requirements analysis
+3. **Stage 3**: Auto-remediation completion
+4. **Stage 4**: Already compliant (if applicable)
+5. **Stage 5**: RFC update processing (bulk operations)

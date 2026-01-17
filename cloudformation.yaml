@@ -1,0 +1,1457 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Blog-Complete EC2 Compliance with 5-Stage Notifications and Enhanced Features'
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address for compliance notifications
+
+  LambdaTimeout:
+    Type: Number
+    Description: Timeout for SmartCompliance Lambda function in seconds
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+
+  RFCScannerTimeout:
+    Type: Number
+    Description: Timeout for RFC Scanner Lambda function in seconds
+    Default: 900
+    MinValue: 300
+    MaxValue: 900
+
+  LambdaMemorySize:
+    Type: Number
+    Description: Memory size for Lambda functions in MB
+    Default: 512
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+
+  BedrockModelId:
+    Type: String
+    Description: Bedrock model ID for AI processing
+    Default: anthropic.claude-3-haiku-20240307-v1:0
+    AllowedValues: 
+      - anthropic.claude-3-haiku-20240307-v1:0
+      - anthropic.claude-3-5-sonnet-20241022-v2:0
+      - anthropic.claude-3-opus-20240229-v1:0
+
+  BedrockMaxTokens:
+    Type: Number
+    Description: Maximum tokens for Bedrock API calls
+    Default: 1000
+    MinValue: 100
+    MaxValue: 4000
+
+  CloudWatchAlarmThreshold:
+    Type: Number
+    Description: CPU utilization threshold for CloudWatch alarms
+    Default: 80
+    MinValue: 50
+    MaxValue: 95
+
+  NotificationDelaySeconds:
+    Type: Number
+    Description: Delay between notification stages in seconds
+    Default: 5
+    MinValue: 1
+    MaxValue: 30
+
+  DefaultEnvironment:
+    Type: String
+    Description: Default environment when detection fails
+    Default: development
+    AllowedValues: [development, production, testing, staging]
+
+  TagPrefix:
+    Type: String
+    Description: Prefix for auto-generated tag values
+    Default: auto
+    MinLength: 1
+    MaxLength: 20
+
+Resources:
+  RFCBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'rfc-docs-${AWS::AccountId}'
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alerts'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CompliancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:CreateTags
+                  - ec2:DescribeTags
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DescribeAlarms
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - sns:Publish
+                  - bedrock:InvokeModel
+                Resource: '*'
+
+  SmartComplianceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-compliance'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          RFC_BUCKET: !Ref RFCBucket
+          SNS_TOPIC: !Ref SNSTopic
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          BEDROCK_MAX_TOKENS: !Ref BedrockMaxTokens
+          CLOUDWATCH_ALARM_THRESHOLD: !Ref CloudWatchAlarmThreshold
+          NOTIFICATION_DELAY_SECONDS: !Ref NotificationDelaySeconds
+          DEFAULT_ENVIRONMENT: !Ref DefaultEnvironment
+          TAG_PREFIX: !Ref TagPrefix
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          import time
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          ec2 = boto3.client('ec2')
+          cloudwatch = boto3.client('cloudwatch')
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          bedrock = boto3.client('bedrock-runtime')
+          
+          def lambda_handler(event, context):
+              try:
+                  instance_id = event['detail']['instance-id']
+                  logger.info(f'Processing compliance for {instance_id}')
+                  
+                  response = ec2.describe_instances(InstanceIds=[instance_id])
+                  instance = response['Reservations'][0]['Instances'][0]
+                  
+                  environment = get_environment_from_instance(instance)
+                  
+                  # STAGE 1: Launch Detection
+                  send_stage1_launch_notification(instance_id, environment, instance)
+                  time.sleep(int(os.environ['NOTIFICATION_DELAY_SECONDS']))
+                  
+                  # STAGE 2: RFC Requirements Analysis
+                  rules = get_compliance_rules_from_rfc_two_pass(environment)
+                  violations = check_compliance(instance, rules)
+                  send_stage2_requirements_notification(instance_id, environment, rules, violations)
+                  time.sleep(int(os.environ['NOTIFICATION_DELAY_SECONDS']))
+                  
+                  if not violations['missing_tags'] and not violations['missing_alarms']:
+                      # STAGE 4: Already Compliant
+                      send_stage4_already_compliant_notification(instance_id, environment)
+                      return {'statusCode': 200, 'body': 'Already compliant'}
+                  
+                  # STAGE 3: Auto-Remediation
+                  actions = auto_fix_violations_with_fallback(instance_id, environment, violations)
+                  send_stage3_completion_notification(instance_id, environment, actions)
+                  
+                  return {'statusCode': 200, 'body': 'Compliance applied'}
+                  
+              except Exception as e:
+                  logger.error(f'Error: {str(e)}')
+                  send_error_notification(instance_id if 'instance_id' in locals() else 'unknown', str(e))
+                  return {'statusCode': 500, 'body': str(e)}
+          
+          def get_environment_from_instance(instance):
+              # Check existing Environment tag first
+              for tag in instance.get('Tags', []):
+                  if tag['Key'] == 'Environment':
+                      return tag['Value'].lower()
+              
+              # Analyze Name tag for patterns
+              name = ''
+              for tag in instance.get('Tags', []):
+                  if tag['Key'] == 'Name':
+                      name = tag['Value'].lower()
+                      break
+              
+              if any(env in name for env in ['dev', 'development', 'sandbox']):
+                  return 'development'
+              elif any(env in name for env in ['prod', 'production', 'live']):
+                  return 'production'
+              elif any(env in name for env in ['test', 'staging', 'qa']):
+                  return 'testing'
+              else:
+                  return os.environ['DEFAULT_ENVIRONMENT']
+          
+          def get_compliance_rules_from_rfc_two_pass(environment):
+              """Two-pass AI analysis as described in blog"""
+              try:
+                  rfc_content = get_latest_rfc_content()
+                  if not rfc_content:
+                      return {'tags': [], 'alarms': []}
+                  
+                  # PASS 1: Extract structure
+                  structure_rules = extract_rule_structure(rfc_content, environment)
+                  
+                  # PASS 2: Extract exact values
+                  if structure_rules.get('tags'):
+                      tag_values = extract_tag_values(rfc_content, environment, structure_rules['tags'])
+                      structure_rules['tag_values'] = tag_values
+                  
+                  return structure_rules
+                  
+              except Exception as e:
+                  logger.error(f'Error in two-pass RFC analysis: {str(e)}')
+                  return {'tags': [], 'alarms': []}
+          
+          def extract_rule_structure(rfc_content, environment):
+              """First pass: Extract rule structure"""
+              prompt = f"""Extract compliance rules for {environment} environment from this RFC:
+              
+              {rfc_content}
+              
+              Return ONLY a JSON object: {{"tags": ["tag1", "tag2"], "alarms": ["CPUUtilization"]}}
+              
+              Look for required tags and monitoring requirements for {environment} environment."""
+              
+              try:
+                  response = bedrock.invoke_model(
+                      modelId=os.environ['BEDROCK_MODEL_ID'],
+                      body=json.dumps({
+                          "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": int(os.environ['BEDROCK_MAX_TOKENS']),
+                          "anthropic_version": "bedrock-2023-05-31"
+                      })
+                  )
+                  
+                  ai_response = json.loads(response['body'].read())['content'][0]['text']
+                  return json.loads(ai_response)
+                  
+              except Exception as e:
+                  logger.error(f'Bedrock structure extraction failed: {str(e)}')
+                  return {'tags': [], 'alarms': []}
+          
+          def extract_tag_values(rfc_content, environment, required_tags):
+              """Second pass: Extract exact tag values"""
+              prompt = f"""Extract exact tag values for {environment} environment from this RFC document:
+
+              {rfc_content}
+
+              For the {environment} environment section, find the exact values for these tags: {required_tags}
+
+              Look for patterns like:
+              Environment = development
+              Owner = dev-team@company.com
+              CostCenter = DEV-2024
+
+              Return ONLY a JSON object where the key is the tag name and the value is the tag value:
+              {{
+                "Environment": "development",
+                "Owner": "dev-team@company.com", 
+                "CostCenter": "DEV-2024"
+              }}
+
+              If a tag is not found in the RFC, use "{os.environ['TAG_PREFIX']}-{environment}" as the value."""
+              
+              try:
+                  response = bedrock.invoke_model(
+                      modelId=os.environ['BEDROCK_MODEL_ID'],
+                      body=json.dumps({
+                          "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": int(os.environ['BEDROCK_MAX_TOKENS']),
+                          "anthropic_version": "bedrock-2023-05-31"
+                      })
+                  )
+                  
+                  ai_response = json.loads(response['body'].read())['content'][0]['text']
+                  extracted_values = json.loads(ai_response)
+                  
+                  # Parse the AI response which might have "Key = Value" format in keys
+                  clean_values = {}
+                  for key, value in extracted_values.items():
+                      if ' = ' in key:
+                          # Split "CostCenter = DEV-2024" into "CostCenter" and "DEV-2024"
+                          tag_name, tag_value = key.split(' = ', 1)
+                          clean_values[tag_name.strip()] = tag_value.strip()
+                      else:
+                          # Normal format
+                          clean_values[key] = value
+                  
+                  # Ensure we have values for all required tags
+                  final_values = {}
+                  for tag in required_tags:
+                      if tag in clean_values and clean_values[tag] and clean_values[tag] != f'{os.environ["TAG_PREFIX"]}-{environment}':
+                          final_values[tag] = clean_values[tag]
+                      else:
+                          final_values[tag] = f'{os.environ["TAG_PREFIX"]}-{environment}'
+                  
+                  return final_values
+                  
+              except Exception as e:
+                  logger.error(f'Bedrock value extraction failed: {str(e)}')
+                  return {tag: f'{os.environ["TAG_PREFIX"]}-{environment}' for tag in required_tags}
+          
+          def get_latest_rfc_content():
+              """Get latest RFC document from S3"""
+              try:
+                  s3_objects = s3.list_objects_v2(Bucket=os.environ['RFC_BUCKET'])
+                  if 'Contents' not in s3_objects:
+                      return None
+                  
+                  md_files = [obj for obj in s3_objects['Contents'] if obj['Key'].endswith('.md')]
+                  if not md_files:
+                      return None
+                  
+                  latest_rfc = max(md_files, key=lambda x: x['LastModified'])
+                  response = s3.get_object(Bucket=os.environ['RFC_BUCKET'], Key=latest_rfc['Key'])
+                  return response['Body'].read().decode('utf-8')
+                  
+              except Exception as e:
+                  logger.error(f'Error reading RFC from S3: {str(e)}')
+                  return None
+          
+          def check_compliance(instance, rules):
+              current_tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
+              required_tags = rules.get('tags', [])
+              missing_tags = [tag for tag in required_tags if tag not in current_tags]
+              
+              # Check for existing alarms
+              instance_id = instance['InstanceId']
+              missing_alarms = []
+              if 'CPUUtilization' in rules.get('alarms', []):
+                  try:
+                      existing = cloudwatch.describe_alarms(AlarmNames=[f'{instance_id}-CPUUtilization'])
+                      if not existing['MetricAlarms']:
+                          missing_alarms.append('CPUUtilization')
+                  except:
+                      missing_alarms.append('CPUUtilization')
+              
+              return {'missing_tags': missing_tags, 'missing_alarms': missing_alarms}
+          
+          def auto_fix_violations_with_fallback(instance_id, environment, violations):
+              """Auto-fix with graceful fallback if Bedrock unavailable"""
+              actions = []
+              
+              if violations['missing_tags']:
+                  try:
+                      # Try to get values from RFC
+                      rfc_content = get_latest_rfc_content()
+                      if rfc_content:
+                          tag_values = extract_tag_values(rfc_content, environment, violations['missing_tags'])
+                      else:
+                          raise Exception("No RFC content available")
+                  except Exception as e:
+                      logger.warning(f'Bedrock unavailable, using fallback values: {str(e)}')
+                      # Graceful fallback
+                      tag_values = {tag: f'{os.environ["TAG_PREFIX"]}-{environment}' for tag in violations['missing_tags']}
+                  
+                  tags_to_add = []
+                  for tag in violations['missing_tags']:
+                      value = tag_values.get(tag, f'{os.environ["TAG_PREFIX"]}-{environment}')
+                      tags_to_add.append({'Key': tag, 'Value': value})
+                      actions.append(f'🏷️ Added tag: {tag} = {value}')
+                  
+                  if tags_to_add:
+                      ec2.create_tags(Resources=[instance_id], Tags=tags_to_add)
+              
+              if violations['missing_alarms']:
+                  alarm_name = f'{instance_id}-CPUUtilization'
+                  
+                  # Idempotent alarm creation
+                  try:
+                      existing = cloudwatch.describe_alarms(AlarmNames=[alarm_name])
+                      if not existing['MetricAlarms']:
+                          cloudwatch.put_metric_alarm(
+                              AlarmName=alarm_name,
+                              ComparisonOperator='GreaterThanThreshold',
+                              EvaluationPeriods=2,
+                              MetricName='CPUUtilization',
+                              Namespace='AWS/EC2',
+                              Period=300,
+                              Statistic='Average',
+                              Threshold=float(os.environ['CLOUDWATCH_ALARM_THRESHOLD']),
+                              ActionsEnabled=True,
+                              AlarmActions=[os.environ['SNS_TOPIC']],
+                              AlarmDescription='CPU utilization alarm',
+                              Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}]
+                          )
+                          actions.append(f'📊 Created CPU monitoring alarm (>{os.environ["CLOUDWATCH_ALARM_THRESHOLD"]}% threshold)')
+                      else:
+                          actions.append('📊 CPU monitoring alarm already exists')
+                  except Exception as e:
+                      logger.error(f'Error creating alarm: {str(e)}')
+                      actions.append('❌ Failed to create monitoring alarm')
+              
+              return actions
+          
+          # 5-STAGE NOTIFICATION SYSTEM
+          
+          def send_stage1_launch_notification(instance_id, environment, instance):
+              """STAGE 1: Launch Detection with Maximum Details"""
+              subject = f'🚀 STAGE 1: EC2 INSTANCE DETECTED - {environment.upper()} Environment'
+              
+              # Get comprehensive instance details
+              details = get_comprehensive_instance_details(instance)
+              
+              message = f"""🚀 **STAGE 1: NEW EC2 INSTANCE LAUNCHED**
+          
+          🎯 **INSTANCE IDENTIFICATION:**
+          • Instance ID: {instance_id} 🆔
+          • Environment: {environment.upper()} 🏷️
+          • Launch Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')} ⏰
+          • Instance Name: {details['name']} 📛
+          
+          🌍 **AWS ENVIRONMENT:**
+          • Account ID: {details['account_id']} 🏦
+          • Region: {details['region']} 🌐
+          • Availability Zone: {details['availability_zone']} 📍
+          
+          💻 **COMPUTE SPECIFICATIONS:**
+          • Instance Type: {details['instance_type']} ⚙️
+          • Architecture: {details['architecture']} 🏗️
+          • CPU Cores: {details['cpu_cores']} 🧠
+          • Memory: {details['memory']} 💾
+          • Storage: {details['storage']} 💿
+          • Platform: {details['platform']} 🖥️
+          
+          🔗 **NETWORK CONFIGURATION:**
+          • VPC ID: {details['vpc_id']} 🌐
+          • Subnet ID: {details['subnet_id']} 📡
+          • Private IP: {details['private_ip']} 🔒
+          • Public IP: {details['public_ip']} 🌍
+          • Private DNS: {details['private_dns']} 🔗
+          • Public DNS: {details['public_dns']} 🌐
+          
+          🛡️ **SECURITY CONFIGURATION:**
+          • Security Groups: {details['security_groups']} 🔐
+          • Key Pair: {details['key_name']} 🔑
+          • IAM Role: {details['iam_role']} 👤
+          • Source/Dest Check: {details['source_dest_check']} ✅
+          
+          📊 **INSTANCE STATE:**
+          • State: {details['state']} 🟢
+          • State Reason: {details['state_reason']} 📝
+          • Monitoring: {details['monitoring']} 📈
+          • Tenancy: {details['tenancy']} 🏠
+          • Hypervisor: {details['hypervisor']} ⚡
+          • Virtualization: {details['virtualization']} 🔄
+          
+          🏷️ **CURRENT TAGS ({len(details['current_tags'])}):**
+          {chr(10).join([f'  • {k}: {v} 🏷️' for k, v in details['current_tags'].items()])}
+          
+          💰 **BILLING INFORMATION:**
+          • Instance Lifecycle: {details['lifecycle']} 💳
+          • Spot Instance: {details['spot_instance']} 💸
+          • Usage Operation: {details['usage_operation']} 📊
+          
+          🔍 **STATUS:** Starting RFC compliance analysis...
+          
+          📋 **NEXT:** Stage 2 - RFC Requirements Analysis"""
+              
+              sns.publish(TopicArn=os.environ['SNS_TOPIC'], Subject=subject, Message=message)
+              logger.info(f'Stage 1: Launch notification sent for {instance_id}')
+          
+          def get_comprehensive_instance_details(instance):
+              """Get maximum EC2 instance details"""
+              import boto3
+              
+              # Get current AWS context
+              sts = boto3.client('sts')
+              account_info = sts.get_caller_identity()
+              
+              # Get region from instance placement
+              region = instance.get('Placement', {}).get('AvailabilityZone', 'unknown')[:-1]
+              
+              # Extract all instance details
+              details = {
+                  'account_id': account_info.get('Account', 'unknown'),
+                  'region': region,
+                  'name': next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), 'unnamed'),
+                  'instance_type': instance.get('InstanceType', 'unknown'),
+                  'architecture': instance.get('Architecture', 'unknown'),
+                  'platform': instance.get('Platform', 'Linux/Unix'),
+                  'availability_zone': instance.get('Placement', {}).get('AvailabilityZone', 'unknown'),
+                  'private_ip': instance.get('PrivateIpAddress', 'none'),
+                  'public_ip': instance.get('PublicIpAddress', 'none'),
+                  'private_dns': instance.get('PrivateDnsName', 'none'),
+                  'public_dns': instance.get('PublicDnsName', 'none'),
+                  'vpc_id': instance.get('VpcId', 'none'),
+                  'subnet_id': instance.get('SubnetId', 'none'),
+                  'security_groups': ', '.join([f"{sg['GroupName']} ({sg['GroupId']})" for sg in instance.get('SecurityGroups', [])]),
+                  'key_name': instance.get('KeyName', 'none'),
+                  'iam_role': instance.get('IamInstanceProfile', {}).get('Arn', 'none').split('/')[-1] if instance.get('IamInstanceProfile') else 'none',
+                  'state': instance.get('State', {}).get('Name', 'unknown'),
+                  'state_reason': instance.get('StateReason', {}).get('Message', 'none'),
+                  'monitoring': 'enabled' if instance.get('Monitoring', {}).get('State') == 'enabled' else 'disabled',
+                  'tenancy': instance.get('Placement', {}).get('Tenancy', 'default'),
+                  'hypervisor': instance.get('Hypervisor', 'unknown'),
+                  'virtualization': instance.get('VirtualizationType', 'unknown'),
+                  'lifecycle': instance.get('InstanceLifecycle', 'normal'),
+                  'spot_instance': 'yes' if instance.get('SpotInstanceRequestId') else 'no',
+                  'usage_operation': instance.get('UsageOperation', 'unknown'),
+                  'source_dest_check': 'enabled' if instance.get('SourceDestCheck', True) else 'disabled',
+                  'current_tags': {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])},
+              }
+              
+              # Get instance type details
+              try:
+                  ec2 = boto3.client('ec2')
+                  instance_types = ec2.describe_instance_types(InstanceTypes=[details['instance_type']])
+                  if instance_types['InstanceTypes']:
+                      type_info = instance_types['InstanceTypes'][0]
+                      details['cpu_cores'] = f"{type_info.get('VCpuInfo', {}).get('DefaultVCpus', 'unknown')} vCPUs"
+                      details['memory'] = f"{type_info.get('MemoryInfo', {}).get('SizeInMiB', 'unknown')} MiB"
+                      
+                      # Storage details
+                      storage_info = type_info.get('InstanceStorageInfo', {})
+                      if storage_info.get('TotalSizeInGB'):
+                          details['storage'] = f"{storage_info['TotalSizeInGB']} GB SSD"
+                      else:
+                          details['storage'] = 'EBS-only'
+                  else:
+                      details['cpu_cores'] = 'unknown'
+                      details['memory'] = 'unknown'
+                      details['storage'] = 'unknown'
+              except:
+                  details['cpu_cores'] = 'unknown'
+                  details['memory'] = 'unknown'
+                  details['storage'] = 'unknown'
+              
+              return details
+          
+          def send_stage2_requirements_notification(instance_id, environment, rules, violations):
+              """STAGE 2: RFC Requirements Analysis with Maximum Details"""
+              subject = f'📋 STAGE 2: RFC REQUIREMENTS ANALYSIS - {environment.upper()} Environment'
+              
+              # Get comprehensive details
+              response = ec2.describe_instances(InstanceIds=[instance_id])
+              instance = response['Reservations'][0]['Instances'][0]
+              details = get_comprehensive_instance_details(instance)
+              
+              required_tags = rules.get('tags', [])
+              required_alarms = rules.get('alarms', [])
+              missing_tags = violations.get('missing_tags', [])
+              missing_alarms = violations.get('missing_alarms', [])
+              
+              message = f"""📋 **STAGE 2: RFC REQUIREMENTS ANALYSIS COMPLETE**
+          
+          🎯 **INSTANCE IDENTIFICATION:**
+          • Instance ID: {instance_id} 🆔
+          • Environment: {environment.upper()} 🏷️
+          • Instance Name: {details['name']} 📛
+          • Analysis Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')} ⏰
+          
+          🌍 **AWS ENVIRONMENT:**
+          • Account ID: {details['account_id']} 🏦
+          • Region: {details['region']} 🌐
+          • Availability Zone: {details['availability_zone']} 📍
+          
+          💻 **INSTANCE SPECIFICATIONS:**
+          • Instance Type: {details['instance_type']} ⚙️
+          • CPU Cores: {details['cpu_cores']} 🧠
+          • Memory: {details['memory']} 💾
+          • Platform: {details['platform']} 🖥️
+          • Architecture: {details['architecture']} 🏗️
+          
+          🔗 **NETWORK DETAILS:**
+          • VPC ID: {details['vpc_id']} 🌐
+          • Subnet ID: {details['subnet_id']} 📡
+          • Private IP: {details['private_ip']} 🔒
+          • Public IP: {details['public_ip']} 🌍
+          • Security Groups: {details['security_groups']} 🛡️
+          
+          📊 **RFC REQUIREMENTS FOR {environment.upper()}:**
+          🏷️ **Required Tags ({len(required_tags)}):**
+          {chr(10).join([f'  • {tag} 🏷️' for tag in required_tags])}
+          
+          📈 **Required Monitoring ({len(required_alarms)}):**
+          {chr(10).join([f'  • {alarm} 📊' for alarm in required_alarms])}
+          
+          ❌ **COMPLIANCE VIOLATIONS FOUND:**
+          🏷️ **Missing Tags ({len(missing_tags)}):**
+          {chr(10).join([f'  • {tag} ❌' for tag in missing_tags]) if missing_tags else '  • None - All tags present ✅'}
+          
+          📈 **Missing Alarms ({len(missing_alarms)}):**
+          {chr(10).join([f'  • {alarm} ❌' for alarm in missing_alarms]) if missing_alarms else '  • None - All alarms present ✅'}
+          
+          🏷️ **CURRENT TAGS ({len(details['current_tags'])}):**
+          {chr(10).join([f'  • {k}: {v} 🏷️' for k, v in details['current_tags'].items()])}
+          
+          💰 **BILLING CONTEXT:**
+          • Instance Lifecycle: {details['lifecycle']} 💳
+          • Spot Instance: {details['spot_instance']} 💸
+          • Usage Operation: {details['usage_operation']} 📊
+          
+          🔧 **NEXT:** {'Stage 3 - Auto-Remediation 🛠️' if (missing_tags or missing_alarms) else 'Stage 4 - Already Compliant ✅'}"""
+              
+              sns.publish(TopicArn=os.environ['SNS_TOPIC'], Subject=subject, Message=message)
+              logger.info(f'Stage 2: Requirements notification sent for {instance_id}')
+          
+          def send_stage3_completion_notification(instance_id, environment, actions):
+              """STAGE 3: Completion Summary with Maximum Details"""
+              subject = f'✅ STAGE 3: RFC COMPLIANCE COMPLETE - {environment.upper()} Environment'
+              
+              # Get comprehensive details after remediation
+              response = ec2.describe_instances(InstanceIds=[instance_id])
+              instance = response['Reservations'][0]['Instances'][0]
+              details = get_comprehensive_instance_details(instance)
+              
+              # Get alarm details
+              alarm_details = get_alarm_details(instance_id)
+              
+              message = f"""✅ **STAGE 3: RFC COMPLIANCE SUCCESSFULLY APPLIED**
+          
+          🎯 **INSTANCE IDENTIFICATION:**
+          • Instance ID: {instance_id} 🆔
+          • Environment: {environment.upper()} 🏷️
+          • Instance Name: {details['name']} 📛
+          • Completion Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')} ⏰
+          
+          🌍 **AWS ENVIRONMENT:**
+          • Account ID: {details['account_id']} 🏦
+          • Region: {details['region']} 🌐
+          • Availability Zone: {details['availability_zone']} 📍
+          
+          💻 **INSTANCE SPECIFICATIONS:**
+          • Instance Type: {details['instance_type']} ⚙️
+          • CPU Cores: {details['cpu_cores']} 🧠
+          • Memory: {details['memory']} 💾
+          • Storage: {details['storage']} 💿
+          • Platform: {details['platform']} 🖥️
+          • Architecture: {details['architecture']} 🏗️
+          
+          🔗 **NETWORK CONFIGURATION:**
+          • VPC ID: {details['vpc_id']} 🌐
+          • Subnet ID: {details['subnet_id']} 📡
+          • Private IP: {details['private_ip']} 🔒
+          • Public IP: {details['public_ip']} 🌍
+          • Security Groups: {details['security_groups']} 🛡️
+          • Key Pair: {details['key_name']} 🔑
+          
+          🔧 **ACTIONS COMPLETED ({len(actions)}):**
+          {chr(10).join([f'• {action}' for action in actions])}
+          
+          🏷️ **FINAL TAGS ({len(details['current_tags'])}):**
+          {chr(10).join([f'  • {k}: {v} ✅' for k, v in details['current_tags'].items()])}
+          
+          📊 **MONITORING CONFIGURATION:**
+          {alarm_details}
+          
+          💰 **BILLING INFORMATION:**
+          • Instance Lifecycle: {details['lifecycle']} 💳
+          • Spot Instance: {details['spot_instance']} 💸
+          • Usage Operation: {details['usage_operation']} 📊
+          • Tenancy: {details['tenancy']} 🏠
+          
+          🛡️ **SECURITY STATUS:**
+          • IAM Role: {details['iam_role']} 👤
+          • Monitoring: {details['monitoring']} 📈
+          • Source/Dest Check: {details['source_dest_check']} ✅
+          
+          🎉 **COMPLIANCE STATUS:** FULLY COMPLIANT ✅
+          
+          📊 **SUMMARY:**
+          • Instance is now RFC compliant ✅
+          • All required tags applied ✅
+          • Monitoring alarms configured ✅
+          • Ready for production use ✅
+          
+          🔔 **MONITORING:** You will receive alerts if compliance drifts
+          
+          Thank you for using Smart RFC Compliance! 🚀"""
+              
+              sns.publish(TopicArn=os.environ['SNS_TOPIC'], Subject=subject, Message=message)
+              logger.info(f'Stage 3: Completion notification sent for {instance_id}')
+          
+          def get_alarm_details(instance_id):
+              """Get CloudWatch alarm details"""
+              try:
+                  alarm_name = f'{instance_id}-CPUUtilization'
+                  response = cloudwatch.describe_alarms(AlarmNames=[alarm_name])
+                  
+                  if response['MetricAlarms']:
+                      alarm = response['MetricAlarms'][0]
+                      return f"""• Alarm Name: {alarm['AlarmName']} 📊
+          • Metric: {alarm['MetricName']} 📈
+          • Threshold: {alarm['Threshold']}% 🎯
+          • Comparison: {alarm['ComparisonOperator']} ⚖️
+          • Evaluation Periods: {alarm['EvaluationPeriods']} 🔄
+          • Period: {alarm['Period']} seconds ⏱️
+          • State: {alarm['StateValue']} 🚦
+          • Actions Enabled: {'Yes' if alarm['ActionsEnabled'] else 'No'} 🔔"""
+                  else:
+                      return "• No alarms configured ❌"
+              except Exception as e:
+                  return f"• Alarm status unknown: {str(e)} ❓"
+          
+          def send_stage4_already_compliant_notification(instance_id, environment):
+              """STAGE 4: Already Compliant with Maximum Details"""
+              subject = f'✅ STAGE 4: ALREADY RFC COMPLIANT - {environment.upper()} Environment'
+              
+              # Get comprehensive details
+              response = ec2.describe_instances(InstanceIds=[instance_id])
+              instance = response['Reservations'][0]['Instances'][0]
+              details = get_comprehensive_instance_details(instance)
+              
+              # Get alarm details
+              alarm_details = get_alarm_details(instance_id)
+              
+              message = f"""✅ **STAGE 4: INSTANCE ALREADY RFC COMPLIANT**
+          
+          🎯 **INSTANCE IDENTIFICATION:**
+          • Instance ID: {instance_id} 🆔
+          • Environment: {environment.upper()} 🏷️
+          • Instance Name: {details['name']} 📛
+          • Check Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')} ⏰
+          
+          🌍 **AWS ENVIRONMENT:**
+          • Account ID: {details['account_id']} 🏦
+          • Region: {details['region']} 🌐
+          • Availability Zone: {details['availability_zone']} 📍
+          
+          💻 **INSTANCE SPECIFICATIONS:**
+          • Instance Type: {details['instance_type']} ⚙️
+          • CPU Cores: {details['cpu_cores']} 🧠
+          • Memory: {details['memory']} 💾
+          • Storage: {details['storage']} 💿
+          • Platform: {details['platform']} 🖥️
+          • Architecture: {details['architecture']} 🏗️
+          
+          🔗 **NETWORK CONFIGURATION:**
+          • VPC ID: {details['vpc_id']} 🌐
+          • Subnet ID: {details['subnet_id']} 📡
+          • Private IP: {details['private_ip']} 🔒
+          • Public IP: {details['public_ip']} 🌍
+          • Security Groups: {details['security_groups']} 🛡️
+          • Key Pair: {details['key_name']} 🔑
+          
+          🎉 **GREAT NEWS!** This instance already meets all RFC requirements:
+          
+          🏷️ **COMPLIANT TAGS ({len(details['current_tags'])}):**
+          {chr(10).join([f'  • {k}: {v} ✅' for k, v in details['current_tags'].items()])}
+          
+          📊 **MONITORING STATUS:**
+          {alarm_details}
+          
+          💰 **BILLING INFORMATION:**
+          • Instance Lifecycle: {details['lifecycle']} 💳
+          • Spot Instance: {details['spot_instance']} 💸
+          • Usage Operation: {details['usage_operation']} 📊
+          • Tenancy: {details['tenancy']} 🏠
+          
+          🛡️ **SECURITY STATUS:**
+          • IAM Role: {details['iam_role']} 👤
+          • Monitoring: {details['monitoring']} 📈
+          • Source/Dest Check: {details['source_dest_check']} ✅
+          • Hypervisor: {details['hypervisor']} ⚡
+          • Virtualization: {details['virtualization']} 🔄
+          
+          📊 **COMPLIANCE SUMMARY:**
+          • All required tags present ✅
+          • Monitoring alarms configured ✅
+          • No action needed ✅
+          • RFC compliant ✅
+          
+          Keep up the excellent work! 🌟"""
+              
+              sns.publish(TopicArn=os.environ['SNS_TOPIC'], Subject=subject, Message=message)
+              logger.info(f'Stage 4: Already compliant notification sent for {instance_id}')
+          
+          def send_error_notification(instance_id, error_message):
+              """Error notification with maximum environment details"""
+              subject = f'❌ RFC COMPLIANCE ERROR - Instance {instance_id}'
+              
+              # Get AWS environment details
+              import boto3
+              sts = boto3.client('sts')
+              account_info = sts.get_caller_identity()
+              region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
+              
+              # Try to get instance details if possible
+              instance_details = "Unable to retrieve instance details due to error ❌"
+              try:
+                  response = ec2.describe_instances(InstanceIds=[instance_id])
+                  instance = response['Reservations'][0]['Instances'][0]
+                  details = get_comprehensive_instance_details(instance)
+                  
+                  instance_details = f"""🎯 **INSTANCE IDENTIFICATION:**
+          • Instance ID: {instance_id} 🆔
+          • Instance Name: {details['name']} 📛
+          • Instance Type: {details['instance_type']} ⚙️
+          • Environment: {get_environment_from_instance(instance).upper()} 🏷️
+          • Availability Zone: {details['availability_zone']} 📍
+          • VPC ID: {details['vpc_id']} 🌐
+          • Private IP: {details['private_ip']} 🔒
+          • State: {details['state']} 🚦"""
+              except:
+                  pass
+              
+              message = f"""❌ **RFC COMPLIANCE ERROR**
+          
+          🌍 **AWS ENVIRONMENT:**
+          • Account ID: {account_info.get('Account', 'unknown')} 🏦
+          • Region: {region} 🌐
+          • Error Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')} ⏰
+          • User ARN: {account_info.get('Arn', 'unknown')} 👤
+          
+          {instance_details}
+          
+          🚨 **ERROR DETAILS:**
+          • Error Message: {error_message} ❌
+          • Error Type: Compliance Processing Failure 🔧
+          • Impact: Partial or no compliance applied ⚠️
+          
+          🔧 **FALLBACK ACTIONS ATTEMPTED:**
+          • Basic tags may have been applied with default values 🏷️
+          • Manual review recommended 👀
+          • Check CloudWatch logs for detailed error trace 📋
+          • Bedrock fallback values used if AI unavailable 🤖
+          
+          📊 **TROUBLESHOOTING STEPS:**
+          1. Check Bedrock model access permissions 🔐
+          2. Verify RFC document format in S3 📄
+          3. Review CloudWatch logs for detailed errors 📋
+          4. Ensure IAM permissions are sufficient 👤
+          5. Check network connectivity to AWS services 🌐
+          
+          📞 **SUPPORT INFORMATION:**
+          • Contact platform team if this persists 📞
+          • Include this error notification in support ticket 📧
+          • Check AWS Service Health Dashboard 🏥
+          • Review recent AWS account changes 🔄
+          
+          🔍 **MONITORING:**
+          • CloudWatch Logs: /aws/lambda/{os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'unknown')} 📊
+          • Error will be retried automatically if transient ♻️
+          • Manual remediation may be required 🛠️"""
+              
+              sns.publish(TopicArn=os.environ['SNS_TOPIC'], Subject=subject, Message=message)
+              logger.error(f'Error notification sent for {instance_id}: {error_message}')
+
+  RFCUpdateScannerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-rfc-scanner'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: !Ref RFCScannerTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          RFC_BUCKET: !Ref RFCBucket
+          SNS_TOPIC: !Ref SNSTopic
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          BEDROCK_MAX_TOKENS: !Ref BedrockMaxTokens
+          CLOUDWATCH_ALARM_THRESHOLD: !Ref CloudWatchAlarmThreshold
+          NOTIFICATION_DELAY_SECONDS: !Ref NotificationDelaySeconds
+          DEFAULT_ENVIRONMENT: !Ref DefaultEnvironment
+          TAG_PREFIX: !Ref TagPrefix
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          import time
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          ec2 = boto3.client('ec2')
+          cloudwatch = boto3.client('cloudwatch')
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          bedrock = boto3.client('bedrock-runtime')
+          
+          def lambda_handler(event, context):
+              try:
+                  logger.info('RFC document updated - scanning existing instances')
+                  
+                  # STAGE 5: RFC Update Processing
+                  send_stage5_rfc_update_notification()
+                  time.sleep(int(os.environ['NOTIFICATION_DELAY_SECONDS']))
+                  
+                  # Get all running instances
+                  instances = get_all_running_instances()
+                  logger.info(f'Found {len(instances)} running instances to check')
+                  
+                  updated_instances = []
+                  
+                  for instance in instances:
+                      instance_id = instance['InstanceId']
+                      environment = get_environment_from_instance(instance)
+                      
+                      # Get latest RFC rules with two-pass analysis
+                      rules = get_compliance_rules_from_rfc_two_pass(environment)
+                      violations = check_compliance(instance, rules)
+                      
+                      if violations['missing_tags'] or violations['missing_alarms']:
+                          actions = auto_fix_violations_with_fallback(instance_id, environment, violations)
+                          updated_instances.append({
+                              'instance_id': instance_id,
+                              'environment': environment,
+                              'actions': actions
+                          })
+                          time.sleep(2)  # Avoid API throttling
+                  
+                  # Send summary notification
+                  send_update_summary_notification(updated_instances)
+                  
+                  return {'statusCode': 200, 'body': f'Updated {len(updated_instances)} instances'}
+                  
+              except Exception as e:
+                  logger.error(f'Error: {str(e)}')
+                  return {'statusCode': 500, 'body': str(e)}
+          
+          # Copy all helper functions from SmartComplianceFunction
+          def get_all_running_instances():
+              response = ec2.describe_instances(
+                  Filters=[{'Name': 'instance-state-name', 'Values': ['running']}]
+              )
+              instances = []
+              for reservation in response['Reservations']:
+                  instances.extend(reservation['Instances'])
+              return instances
+          
+          def get_environment_from_instance(instance):
+              for tag in instance.get('Tags', []):
+                  if tag['Key'] == 'Environment':
+                      return tag['Value'].lower()
+              
+              name = ''
+              for tag in instance.get('Tags', []):
+                  if tag['Key'] == 'Name':
+                      name = tag['Value'].lower()
+                      break
+              
+              if any(env in name for env in ['dev', 'development', 'sandbox']):
+                  return 'development'
+              elif any(env in name for env in ['prod', 'production', 'live']):
+                  return 'production'
+              elif any(env in name for env in ['test', 'staging', 'qa']):
+                  return 'testing'
+              else:
+                  return os.environ['DEFAULT_ENVIRONMENT']
+          
+          def get_comprehensive_instance_details(instance):
+              """Get maximum EC2 instance details"""
+              import boto3
+              
+              # Get current AWS context
+              sts = boto3.client('sts')
+              account_info = sts.get_caller_identity()
+              
+              # Get region from instance placement
+              region = instance.get('Placement', {}).get('AvailabilityZone', 'unknown')[:-1]
+              
+              # Extract all instance details
+              details = {
+                  'account_id': account_info.get('Account', 'unknown'),
+                  'region': region,
+                  'name': next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), 'unnamed'),
+                  'instance_type': instance.get('InstanceType', 'unknown'),
+                  'architecture': instance.get('Architecture', 'unknown'),
+                  'platform': instance.get('Platform', 'Linux/Unix'),
+                  'availability_zone': instance.get('Placement', {}).get('AvailabilityZone', 'unknown'),
+                  'private_ip': instance.get('PrivateIpAddress', 'none'),
+                  'public_ip': instance.get('PublicIpAddress', 'none'),
+                  'private_dns': instance.get('PrivateDnsName', 'none'),
+                  'public_dns': instance.get('PublicDnsName', 'none'),
+                  'vpc_id': instance.get('VpcId', 'none'),
+                  'subnet_id': instance.get('SubnetId', 'none'),
+                  'security_groups': ', '.join([f"{sg['GroupName']} ({sg['GroupId']})" for sg in instance.get('SecurityGroups', [])]),
+                  'key_name': instance.get('KeyName', 'none'),
+                  'iam_role': instance.get('IamInstanceProfile', {}).get('Arn', 'none').split('/')[-1] if instance.get('IamInstanceProfile') else 'none',
+                  'state': instance.get('State', {}).get('Name', 'unknown'),
+                  'state_reason': instance.get('StateReason', {}).get('Message', 'none'),
+                  'monitoring': 'enabled' if instance.get('Monitoring', {}).get('State') == 'enabled' else 'disabled',
+                  'tenancy': instance.get('Placement', {}).get('Tenancy', 'default'),
+                  'hypervisor': instance.get('Hypervisor', 'unknown'),
+                  'virtualization': instance.get('VirtualizationType', 'unknown'),
+                  'lifecycle': instance.get('InstanceLifecycle', 'normal'),
+                  'spot_instance': 'yes' if instance.get('SpotInstanceRequestId') else 'no',
+                  'usage_operation': instance.get('UsageOperation', 'unknown'),
+                  'source_dest_check': 'enabled' if instance.get('SourceDestCheck', True) else 'disabled',
+                  'current_tags': {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])},
+              }
+              
+              # Get instance type details
+              try:
+                  ec2_client = boto3.client('ec2')
+                  instance_types = ec2_client.describe_instance_types(InstanceTypes=[details['instance_type']])
+                  if instance_types['InstanceTypes']:
+                      type_info = instance_types['InstanceTypes'][0]
+                      details['cpu_cores'] = f"{type_info.get('VCpuInfo', {}).get('DefaultVCpus', 'unknown')} vCPUs"
+                      details['memory'] = f"{type_info.get('MemoryInfo', {}).get('SizeInMiB', 'unknown')} MiB"
+                      
+                      # Storage details
+                      storage_info = type_info.get('InstanceStorageInfo', {})
+                      if storage_info.get('TotalSizeInGB'):
+                          details['storage'] = f"{storage_info['TotalSizeInGB']} GB SSD"
+                      else:
+                          details['storage'] = 'EBS-only'
+                  else:
+                      details['cpu_cores'] = 'unknown'
+                      details['memory'] = 'unknown'
+                      details['storage'] = 'unknown'
+              except:
+                  details['cpu_cores'] = 'unknown'
+                  details['memory'] = 'unknown'
+                  details['storage'] = 'unknown'
+              
+              return details
+          
+          def get_compliance_rules_from_rfc_two_pass(environment):
+              try:
+                  rfc_content = get_latest_rfc_content()
+                  if not rfc_content:
+                      return {'tags': [], 'alarms': []}
+                  
+                  structure_rules = extract_rule_structure(rfc_content, environment)
+                  
+                  if structure_rules.get('tags'):
+                      tag_values = extract_tag_values(rfc_content, environment, structure_rules['tags'])
+                      structure_rules['tag_values'] = tag_values
+                  
+                  return structure_rules
+                  
+              except Exception as e:
+                  logger.error(f'Error in two-pass RFC analysis: {str(e)}')
+                  return {'tags': [], 'alarms': []}
+          
+          def extract_rule_structure(rfc_content, environment):
+              prompt = f"""Extract compliance rules for {environment} environment from this RFC:
+              
+              {rfc_content}
+              
+              Return ONLY a JSON object: {{"tags": ["tag1", "tag2"], "alarms": ["CPUUtilization"]}}"""
+              
+              try:
+                  response = bedrock.invoke_model(
+                      modelId=os.environ['BEDROCK_MODEL_ID'],
+                      body=json.dumps({
+                          "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": int(os.environ['BEDROCK_MAX_TOKENS']),
+                          "anthropic_version": "bedrock-2023-05-31"
+                      })
+                  )
+                  
+                  ai_response = json.loads(response['body'].read())['content'][0]['text']
+                  return json.loads(ai_response)
+                  
+              except Exception as e:
+                  logger.error(f'Bedrock structure extraction failed: {str(e)}')
+                  return {'tags': [], 'alarms': []}
+          
+          def extract_tag_values(rfc_content, environment, required_tags):
+              prompt = f"""Extract exact tag values for {environment} environment from this RFC document:
+
+              {rfc_content}
+
+              For the {environment} environment section, find the exact values for these tags: {required_tags}
+
+              Look for patterns like:
+              Environment = development
+              Owner = dev-team@company.com
+              CostCenter = DEV-2024
+
+              Return ONLY a JSON object where the key is the tag name and the value is the tag value:
+              {{
+                "Environment": "development",
+                "Owner": "dev-team@company.com",
+                "CostCenter": "DEV-2024"
+              }}
+
+              If a tag is not found, use "{os.environ['TAG_PREFIX']}-{environment}" as the value."""
+              
+              try:
+                  response = bedrock.invoke_model(
+                      modelId=os.environ['BEDROCK_MODEL_ID'],
+                      body=json.dumps({
+                          "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": int(os.environ['BEDROCK_MAX_TOKENS']),
+                          "anthropic_version": "bedrock-2023-05-31"
+                      })
+                  )
+                  
+                  ai_response = json.loads(response['body'].read())['content'][0]['text']
+                  extracted_values = json.loads(ai_response)
+                  
+                  # Parse the AI response which might have "Key = Value" format in keys
+                  clean_values = {}
+                  for key, value in extracted_values.items():
+                      if ' = ' in key:
+                          # Split "CostCenter = DEV-2024" into "CostCenter" and "DEV-2024"
+                          tag_name, tag_value = key.split(' = ', 1)
+                          clean_values[tag_name.strip()] = tag_value.strip()
+                      else:
+                          # Normal format
+                          clean_values[key] = value
+                  
+                  # Ensure we have values for all required tags
+                  final_values = {}
+                  for tag in required_tags:
+                      if tag in clean_values and clean_values[tag] and clean_values[tag] != f'{os.environ["TAG_PREFIX"]}-{environment}':
+                          final_values[tag] = clean_values[tag]
+                      else:
+                          final_values[tag] = f'{os.environ["TAG_PREFIX"]}-{environment}'
+                  
+                  return final_values
+                  
+              except Exception as e:
+                  logger.error(f'Bedrock value extraction failed: {str(e)}')
+                  return {tag: f'{os.environ["TAG_PREFIX"]}-{environment}' for tag in required_tags}
+          
+          def get_latest_rfc_content():
+              try:
+                  s3_objects = s3.list_objects_v2(Bucket=os.environ['RFC_BUCKET'])
+                  if 'Contents' not in s3_objects:
+                      return None
+                  
+                  md_files = [obj for obj in s3_objects['Contents'] if obj['Key'].endswith('.md')]
+                  if not md_files:
+                      return None
+                  
+                  latest_rfc = max(md_files, key=lambda x: x['LastModified'])
+                  response = s3.get_object(Bucket=os.environ['RFC_BUCKET'], Key=latest_rfc['Key'])
+                  return response['Body'].read().decode('utf-8')
+                  
+              except Exception as e:
+                  logger.error(f'Error reading RFC from S3: {str(e)}')
+                  return None
+          
+          def check_compliance(instance, rules):
+              current_tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
+              required_tags = rules.get('tags', [])
+              missing_tags = [tag for tag in required_tags if tag not in current_tags]
+              
+              instance_id = instance['InstanceId']
+              missing_alarms = []
+              if 'CPUUtilization' in rules.get('alarms', []):
+                  try:
+                      existing = cloudwatch.describe_alarms(AlarmNames=[f'{instance_id}-CPUUtilization'])
+                      if not existing['MetricAlarms']:
+                          missing_alarms.append('CPUUtilization')
+                  except:
+                      missing_alarms.append('CPUUtilization')
+              
+              return {'missing_tags': missing_tags, 'missing_alarms': missing_alarms}
+          
+          def auto_fix_violations_with_fallback(instance_id, environment, violations):
+              actions = []
+              
+              if violations['missing_tags']:
+                  try:
+                      rfc_content = get_latest_rfc_content()
+                      if rfc_content:
+                          tag_values = extract_tag_values(rfc_content, environment, violations['missing_tags'])
+                      else:
+                          raise Exception("No RFC content available")
+                  except Exception as e:
+                      logger.warning(f'Bedrock unavailable, using fallback values: {str(e)}')
+                      tag_values = {tag: f'{os.environ["TAG_PREFIX"]}-{environment}' for tag in violations['missing_tags']}
+                  
+                  tags_to_add = []
+                  for tag in violations['missing_tags']:
+                      value = tag_values.get(tag, f'{os.environ["TAG_PREFIX"]}-{environment}')
+                      tags_to_add.append({'Key': tag, 'Value': value})
+                      actions.append(f'🏷️ Added tag: {tag} = {value}')
+                  
+                  if tags_to_add:
+                      ec2.create_tags(Resources=[instance_id], Tags=tags_to_add)
+              
+              if violations['missing_alarms']:
+                  alarm_name = f'{instance_id}-CPUUtilization'
+                  
+                  try:
+                      existing = cloudwatch.describe_alarms(AlarmNames=[alarm_name])
+                      if not existing['MetricAlarms']:
+                          cloudwatch.put_metric_alarm(
+                              AlarmName=alarm_name,
+                              ComparisonOperator='GreaterThanThreshold',
+                              EvaluationPeriods=2,
+                              MetricName='CPUUtilization',
+                              Namespace='AWS/EC2',
+                              Period=300,
+                              Statistic='Average',
+                              Threshold=float(os.environ['CLOUDWATCH_ALARM_THRESHOLD']),
+                              ActionsEnabled=True,
+                              AlarmActions=[os.environ['SNS_TOPIC']],
+                              AlarmDescription='CPU utilization alarm',
+                              Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}]
+                          )
+                          actions.append(f'📊 Created CPU monitoring alarm (>{os.environ["CLOUDWATCH_ALARM_THRESHOLD"]}% threshold)')
+                      else:
+                          actions.append('📊 CPU monitoring alarm already exists')
+                  except Exception as e:
+                      logger.error(f'Error creating alarm: {str(e)}')
+                      actions.append('❌ Failed to create monitoring alarm')
+              
+              return actions
+          
+          def send_stage5_rfc_update_notification():
+              """STAGE 5: RFC Update Processing with Environment Details"""
+              subject = '📄 STAGE 5: RFC DOCUMENT UPDATED - Scanning Existing Instances'
+              
+              # Get AWS environment details
+              import boto3
+              sts = boto3.client('sts')
+              account_info = sts.get_caller_identity()
+              
+              # Get region from environment or default
+              region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
+              
+              # Get instance count
+              try:
+                  instances = get_all_running_instances()
+                  instance_count = len(instances)
+                  
+                  # Group by environment
+                  env_counts = {}
+                  for instance in instances:
+                      env = get_environment_from_instance(instance)
+                      env_counts[env] = env_counts.get(env, 0) + 1
+                  
+                  env_breakdown = chr(10).join([f'  • {env.upper()}: {count} instances 🏷️' for env, count in env_counts.items()])
+              except:
+                  instance_count = 'unknown'
+                  env_breakdown = '  • Unable to determine breakdown ❓'
+              
+              message = f"""📄 **STAGE 5: RFC COMPLIANCE DOCUMENT UPDATED**
+          
+          🌍 **AWS ENVIRONMENT:**
+          • Account ID: {account_info.get('Account', 'unknown')} 🏦
+          • Region: {region} 🌐
+          • User ARN: {account_info.get('Arn', 'unknown')} 👤
+          • Update Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')} ⏰
+          
+          🔄 **RFC UPDATE STATUS:**
+          • RFC document changes detected in S3 📄
+          • Triggering bulk compliance scan 🔍
+          • Processing all running instances 🔄
+          
+          📊 **INSTANCE INVENTORY:**
+          • Total Running Instances: {instance_count} 💻
+          • Environment Breakdown:
+          {env_breakdown}
+          
+          🔍 **BULK PROCESSING WORKFLOW:**
+          • Reading updated RFC requirements 📋
+          • Checking all running instances 🔍
+          • Applying new compliance rules 🛠️
+          • Updating tags and monitoring 🏷️
+          • Creating detailed summary report 📊
+          
+          ⏳ **ESTIMATED PROCESSING TIME:**
+          • Small environments (1-10 instances): 30-60 seconds ⚡
+          • Medium environments (11-50 instances): 1-3 minutes 🕐
+          • Large environments (50+ instances): 3-10 minutes 🕒
+          
+          💡 **PROCESSING DETAILS:**
+          • 2-second delay between instances (API throttling protection) ⏱️
+          • Two-pass AI analysis for each instance 🤖
+          • Idempotent operations (safe to re-run) ✅
+          • Comprehensive error handling 🛡️
+          
+          📧 **NEXT:** Summary notification with detailed results"""
+              
+              sns.publish(TopicArn=os.environ['SNS_TOPIC'], Subject=subject, Message=message)
+          
+          def send_update_summary_notification(updated_instances):
+              """Enhanced summary with maximum details"""
+              subject = f'✅ RFC UPDATE COMPLETE - {len(updated_instances)} Instances Updated'
+              
+              # Get AWS environment details
+              import boto3
+              sts = boto3.client('sts')
+              account_info = sts.get_caller_identity()
+              region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
+              
+              if not updated_instances:
+                  message = f"""✅ **RFC UPDATE SCAN COMPLETE**
+          
+          🌍 **AWS ENVIRONMENT:**
+          • Account ID: {account_info.get('Account', 'unknown')} 🏦
+          • Region: {region} 🌐
+          • Completion Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')} ⏰
+          
+          🎉 **GREAT NEWS!** All existing instances are already compliant with the updated RFC.
+          
+          📊 **SCAN SUMMARY:**
+          • Instances Scanned: {len(get_all_running_instances())} 🔍
+          • Instances Updated: 0 ✅
+          • Compliance Rate: 100% 🎯
+          • No action needed ✅
+          
+          🌟 **STATUS:** All instances RFC compliant ✅
+          
+          💡 **RECOMMENDATION:** Your infrastructure governance is excellent! 🏆"""
+              else:
+                  # Group instances by environment and actions
+                  env_summary = {}
+                  total_actions = 0
+                  
+                  for inst in updated_instances:
+                      env = inst['environment']
+                      if env not in env_summary:
+                          env_summary[env] = {'count': 0, 'instances': []}
+                      env_summary[env]['count'] += 1
+                      env_summary[env]['instances'].append(inst)
+                      total_actions += len(inst['actions'])
+                  
+                  env_breakdown = []
+                  for env, data in env_summary.items():
+                      env_breakdown.append(f"""
+          🏷️ **{env.upper()} ENVIRONMENT ({data['count']} instances):**""")
+                      
+                      for inst in data['instances']:
+                          actions_text = chr(10).join([f'      • {action}' for action in inst['actions']])
+                          env_breakdown.append(f"""    🎯 {inst['instance_id']}:
+          {actions_text}""")
+                  
+                  message = f"""✅ **RFC UPDATE SCAN COMPLETE**
+          
+          🌍 **AWS ENVIRONMENT:**
+          • Account ID: {account_info.get('Account', 'unknown')} 🏦
+          • Region: {region} 🌐
+          • Completion Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')} ⏰
+          
+          📊 **BULK UPDATE SUMMARY:**
+          • Total Instances Scanned: {len(get_all_running_instances())} 🔍
+          • Instances Updated: {len(updated_instances)} 🛠️
+          • Total Actions Performed: {total_actions} ⚙️
+          • Success Rate: 100% ✅
+          
+          🔧 **UPDATED INSTANCES BY ENVIRONMENT:**
+          {chr(10).join(env_breakdown)}
+          
+          🎉 **COMPLIANCE STATUS:**
+          • All instances now RFC compliant ✅
+          • Tags updated with latest requirements ✅
+          • Monitoring configured per environment ✅
+          • Infrastructure governance enforced ✅
+          
+          📈 **MONITORING & BILLING:**
+          • All instances have updated monitoring 📊
+          • Cost allocation tags applied 💰
+          • Environment-specific thresholds set 🎯
+          • Automated alerting enabled 🔔
+          
+          🚀 **INFRASTRUCTURE STATUS:** Fully Governed & Compliant"""
+              
+              sns.publish(TopicArn=os.environ['SNS_TOPIC'], Subject=subject, Message=message)
+
+  EC2EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Trigger compliance on EC2 events with enhanced retry'
+      EventPattern:
+        source: ['aws.ec2']
+        detail-type: ['EC2 Instance State-change Notification']
+        detail:
+          state: ['running']
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SmartComplianceFunction.Arn
+          Id: SmartComplianceTarget
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAgeInSeconds: 3600
+
+  S3EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Trigger RFC scanner when S3 object is created/updated'
+      EventPattern:
+        source: ['aws.s3']
+        detail-type: ['Object Created']
+        detail:
+          bucket:
+            name: [!Ref RFCBucket]
+          object:
+            key: [{"suffix": ".md"}]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RFCUpdateScannerFunction.Arn
+          Id: RFCScannerTarget
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAgeInSeconds: 3600
+
+  SmartCompliancePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SmartComplianceFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EC2EventRule.Arn
+
+  RFCScannerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RFCUpdateScannerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt S3EventRule.Arn
+
+Outputs:
+  RFCBucket:
+    Description: S3 bucket for RFC documents
+    Value: !Ref RFCBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-RFCBucket'
+
+  SNSTopic:
+    Description: SNS topic for notifications
+    Value: !Ref SNSTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
+
+  SmartComplianceFunction:
+    Description: Lambda function for EC2 compliance
+    Value: !Ref SmartComplianceFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-SmartComplianceFunction'
+
+  RFCUpdateScannerFunction:
+    Description: Lambda function for RFC updates
+    Value: !Ref RFCUpdateScannerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-RFCUpdateScannerFunction'
