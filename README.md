@@ -224,20 +224,10 @@ This is an open-source approach to AWS compliance. Contributions welcome:
 1. Fork the repository
 2. Create feature branch
 3. Add tests for new functionality
-4. Submit pull request with detailed description
+4. Submit pull request with a detailed description
 
 ## 📞 Support
-
-- **Documentation**: Check [DOCUMENTATION.md](DOCUMENTATION.md) for detailed guides
-- **Troubleshooting**: Review CloudWatch logs and common issues section
+- **Troubleshooting**: Review CloudWatch logs and the common issues section
 - **Community**: Share experiences and improvements
 
-## 🎉 Success Stories
 
-> "Reduced our tagging compliance overhead from 8 hours/week to 0. The AI-powered RFC processing means we can update policies in plain English instead of complex JSON rules." - DevOps Team Lead
-
-> "Achieved 99.9% tag compliance rate and saved $45K annually in operational costs. The real-time enforcement means developers never have to think about tagging again." - Cloud Architect
-
----
-
-**Ready to eliminate your tagging headaches?** Deploy in 5 minutes and experience zero-friction compliance automation!
