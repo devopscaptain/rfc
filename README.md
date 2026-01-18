@@ -61,13 +61,13 @@ Manual Work: 0 hours/week
 ```bash
 # Clone the repository
 git clone <repository-url>
-cd ec2-tag-compliance
+cd rfc
 
 # Make script executable
-chmod +x test-enhanced-solution.sh
+chmod +x solution.sh
 
 # Deploy everything (takes ~5 minutes)
-./test-enhanced-solution.sh
+./solution.sh
 ```
 
 The script will:
@@ -222,9 +222,9 @@ Built-in observability:
 
 This is an open-source approach to AWS compliance. Contributions welcome:
 1. Fork the repository
-2. Create feature branch
+2. Create a feature branch
 3. Add tests for new functionality
-4. Submit pull request with a detailed description
+4. Submit a pull request with a detailed description
 
 ## 📞 Support
 - **Troubleshooting**: Review CloudWatch logs and the common issues section
